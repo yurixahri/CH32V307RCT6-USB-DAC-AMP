@@ -11,7 +11,7 @@ Build with Mounriver Studio, and flash with WCHISPStudio. To flash firmware, con
 
 In schematic, i do include R series for TPA6138A2 UVP pin, but please leave it empty when assemble.
 
-## Credits
+## References
 - https://github.com/LoveLonelyTime/USBAudioToI2S (Base schematic, but swap CPLD with simple multiplexer)
 - https://cdn.promelec.ru/upload/items/2023/10/13/CH32V303-305-307_.PDF
 - https://www.ti.com/lit/ds/symlink/tpa6138a2.pdf?ts=1786771209908
