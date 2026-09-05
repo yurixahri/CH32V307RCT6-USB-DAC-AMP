@@ -1,0 +1,36 @@
+Reference,Qty,Value,Replacement,Footprint,Datasheet
+BOOT0,1,BOOT0,,Button_Switch_SMD:SW_Push_SPST_NO_Alps_SKRK,
+"C1,C2,C3,C4,C5,C10,C11,C12,C13,C15,C17,C25",12,100nf,,Capacitor_SMD:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,
+"C6,C9,C24,C28,C31",5,1uf,,Capacitor_SMD:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,
+"C7,C8",2,12pf,,Capacitor_SMD:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,
+"C14,C35,C36",3,10uf,,Capacitor_SMD:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,
+"C16,C18,C21,C26,C30,C34",6,2.2uf,,Capacitor_SMD:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,
+"C19,C20",2,2.2nf,,Capacitor_SMD:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,
+"C22,C33",2,180pf,150pf,Capacitor_SMD:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,
+"C23,C27,C29,C32",4,47pf,,Capacitor_SMD:C_0805_2012Metric_Pad1.18x1.45mm_HandSolder,
+D1,1,LED,,LED_SMD:LED_0805_2012Metric_Pad1.15x1.40mm_HandSolder,
+"FB1,FB2",2,BLM18AG601SN1D,,Inductor_SMD:L_0603_1608Metric_Pad1.05x0.95mm_HandSolder,
+"FB3,FB4",2,BLM18AG121SN1D,,Inductor_SMD:L_0603_1608Metric_Pad1.05x0.95mm_HandSolder,
+J1,1,USB_B,,Connector_USB:USB_B_Lumberg_2411_02_Horizontal,
+J2,1,WCH-LinkE,,Connector_PinHeader_2.54mm:PinHeader_1x04_P2.54mm_Vertical,
+"J3,J4",2,AudioJack3_Dual_Switch,,custom_lib:PJ-307,
+M1,1,TPA6138A2,,Package_SO:TSSOP-14_4.4x5mm_P0.65mm,
+"R1,R2,R3,R22,R27,R30",6,10k Ohm,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+"R4,R23",2,1k Ohm,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+"R5,R6,R7,R8,R9,R17",6,22 Ohm,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+"R10,R11",2,470 Ohm,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+"R12,R15,R20,R24",4,15k Ohm,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+"R13,R16,R21,R25",4,43k Ohm,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+"R14,R18,R19,R26",4,30k Ohm,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+"R28,R29",2,100 Ohm,,Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder,
+RST0,1,RST,,Button_Switch_SMD:SW_Push_SPST_NO_Alps_SKRK,
+RV1,1,R_Potentiometer_Dual,,Potentiometer_THT:Potentiometer_Alps_RK097_Dual_Horizontal,
+U1,1,USBLC6-2SC6,,Package_TO_SOT_SMD:SOT-23-6,https://www.st.com/resource/en/datasheet/usblc6-2.pdf
+U2,1,CH32V30xRxTx,,Package_QFP:LQFP-64_10x10mm_P0.5mm,http://www.wch-ic.com/products/CH32V307.html?
+U3,1,LP5907MFX-3.3,,Package_TO_SOT_SMD:SOT-23-5,http://www.ti.com/lit/ds/symlink/lp5907.pdf
+U4,1,74LVC1G157GW,,Package_TO_SOT_SMD:SOT-363_SC-70-6,https://assets.nexperia.com/documents/data-sheet/74LVC1G157.pdf
+U5,1,PCM5102,,Package_SO:TSSOP-20_4.4x6.5mm_P0.65mm,http://www.ti.com/lit/ds/symlink/pcm5102.pdf
+X32258MOB4SI1,1,8_MHZ,,Crystal:Crystal_SMD_3225-4Pin_3.2x2.5mm_HandSoldering,
+"Y1,Y3",2,CCHD-575-25-24.576,,Oscillator:Oscillator_SMD_IQD_IQXO70-4Pin_7.5x5.0mm,http://www.iqdfrequencyproducts.com/products/details/iqxo-70-11-30.pdf
+Y2,1,OT322524.576MJBA4SL,,Oscillator:Oscillator_SMD_Abracon_ASE-4Pin_3.2x2.5mm,http://www.abracon.com/Oscillators/ASV.pdf
+Y4,1,KC3225Z22.5792C15XXK,SX3M22.5792B10F20TNN,Oscillator:Oscillator_SMD_Abracon_ASE-4Pin_3.2x2.5mm,http://www.abracon.com/Oscillators/ASV.pdf
