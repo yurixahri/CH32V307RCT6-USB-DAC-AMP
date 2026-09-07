@@ -143,7 +143,6 @@ void DMA1_Channel5_IRQHandler(void) {
 }
 
 volatile uint8_t playback_started = 0;
-volatile uint32_t underflow_count = 0;
 void Fetch_Audio_Data(uint8_t *dest, uint32_t length) {
     uint32_t local_rd, local_wr;
 
@@ -172,10 +171,8 @@ void Fetch_Audio_Data(uint8_t *dest, uint32_t length) {
     // 2. Underflow protection
     uint16_t *dest_16 = (uint16_t *)dest;
     if (available < bytes_needed) {
-        underflow_count++;
-        printf("underflow: %u", underflow_count);
         memset(dest, 0, length);
-        // playback_started = 0;
+        playback_started = 0;
         return;
     }
 
