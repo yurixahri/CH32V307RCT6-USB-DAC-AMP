@@ -725,10 +725,6 @@ void USBHS_IRQHandler( void )
                     if( (uint8_t)(USBHS_SetupReqIndex & 0xFF) == 0x01 ){
                         current_alt_setting = (uint8_t)(USBHS_SetupReqValue & 0xFF);
                         if (current_alt_setting == 0) {
-                            DMA_Cmd(DMA1_Channel5, DISABLE);
-                            SPI_I2S_DMACmd(SPI2, SPI_I2S_DMAReq_Tx, DISABLE);
-                            I2S_Cmd(SPI2, DISABLE);
-
                             audio_wr_ptr = 0;
                             audio_rd_ptr = 0;
                             playback_started = 0;
