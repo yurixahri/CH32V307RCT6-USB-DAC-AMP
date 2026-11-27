@@ -94,7 +94,36 @@ volatile int64_t feedback_integral = 0;          // Bộ tích phân PI
 volatile uint32_t current_avail;
 volatile int32_t smoothed_avail;
 volatile uint8_t current_alt_setting = 0;
-uint32_t target_freq;
+volatile uint32_t target_freq = 48000;
+volatile uint8_t i2s_reinit_pending = 0;
+static __attribute__((aligned(4))) uint8_t selector_cur = 1;
+
+static uint32_t Calc_Nominal_Feedback(uint32_t freq)
+{
+    if (freq == 44100) {
+        return 0x00057800; // (43750 / 8000) * 65536
+    } else if (freq == 48000) {
+        return (uint32_t)((47945.205 / 8000.0) * 65536.0);
+    } else if (freq == 96000) {
+        return 0x000C04EC; // (96153.85 / 8000) * 65536
+    } else if (freq == 192000) {
+        return 0x001809D9;
+    }
+    return 0x00060000;
+}
+
+void USB_Audio_Process(void)
+{
+    if (i2s_reinit_pending) {
+        __disable_irq();
+        i2s_reinit_pending = 0;
+        uint32_t freq = target_freq;
+        uint16_t depth = current_bit_depth;
+        __enable_irq();
+
+        I2S2_Init(freq, depth);
+    }
+}
 
 /******************************************************************************/
 /* Interrupt Service Routine Declaration*/
@@ -183,19 +212,20 @@ void USBHS_Device_Endp_Init ( void ){
     USBHSD->UEP0_TX_CTRL = USBHS_UEP_T_RES_NAK;
     USBHSD->UEP0_RX_CTRL = USBHS_UEP_R_RES_ACK;
 
-    /* EP1: Nhận nhạc (RX) */
+    /* EP1: Nhận nhạc (RX) - Isochronous OUT (bit 17 = USBHS_UEP1_R_TYPE) */
     USBHSD->UEP1_RX_DMA   = (uint32_t)USBHS_EP1_Rx_Buf;
     USBHSD->UEP1_MAX_LEN  = DEF_USBD_HS_ISO_PACK_SIZE;
-    USBHSD->ENDP_TYPE = (USBHSD->ENDP_TYPE & ~(3 << 2)) | (1 << 2); // Isochronous
-    USBHSD->UEP1_RX_CTRL = USBHS_UEP_R_RES_ACK;
-    USBHSD->UEP1_TX_CTRL = USBHS_UEP_T_RES_STALL;
+    USBHSD->UEP1_RX_CTRL  = USBHS_UEP_R_TOG_DATA0 | USBHS_UEP_R_RES_ACK;
+    USBHSD->UEP1_TX_CTRL  = USBHS_UEP_T_RES_STALL;
 
-    /* EP2: Gửi Feedback (TX) */
+    /* EP2: Gửi Feedback (TX) - Isochronous IN (bit 2 = USBHS_UEP2_T_TYPE) */
     USBHSD->UEP2_TX_DMA   = (uint32_t)USBHS_EP2_Tx_Buf;
     USBHSD->UEP2_MAX_LEN  = 4; // Cực kỳ an toàn!
-    USBHSD->ENDP_TYPE = (USBHSD->ENDP_TYPE & ~(3 << 18)) | (1 << 18); // Isochronous
-    USBHSD->UEP2_RX_CTRL = USBHS_UEP_R_RES_STALL;
-    USBHSD->UEP2_TX_CTRL = USBHS_UEP_T_RES_NAK;
+    USBHSD->UEP2_RX_CTRL  = USBHS_UEP_R_RES_STALL;
+    USBHSD->UEP2_TX_CTRL  = USBHS_UEP_T_TOG_DATA0 | USBHS_UEP_T_RES_NAK;
+
+    /* Đặt đúng bit Isochronous cho EP1_R (0x00020000) và EP2_T (0x00000004) */
+    USBHSD->ENDP_TYPE   = USBHS_UEP1_R_TYPE | USBHS_UEP2_T_TYPE;
 
     /* Kích hoạt vật lý: EP1_R và EP2_T */
     USBHSD->ENDP_CONFIG = USBHS_UEP1_R_EN | USBHS_UEP2_T_EN;
@@ -403,45 +433,58 @@ void USBHS_IRQHandler( void )
 
                     /* Endpoint 2 IN: Nơi gửi Feedback dữ liệu Audio */
                     case USBHS_UIS_TOKEN_IN | DEF_UEP2: {
-                        uint32_t wr_ptr = audio_wr_ptr;
-                        uint32_t rd_ptr = audio_rd_ptr;
+                        if (!playback_started) {
+                            /* Khi chưa bắt đầu phát (đang nạp 50% ring buffer đầu tiên),
+                             * giữ feedback ở mức danh định để tránh tích phân PI bị bão hòa (windup) */
+                            dynamic_fb = audio_feedback_val;
+                            smoothed_avail = AUDIO_RING_SIZE / 2;
+                            smoothed_avail_fp = (int64_t)(AUDIO_RING_SIZE / 2) << 16;
+                            feedback_integral = 0;
+                        } else {
+                            uint32_t wr_ptr = audio_wr_ptr;
+                            uint32_t rd_ptr = audio_rd_ptr;
 
-                        current_avail = (wr_ptr >= rd_ptr) ?
-                                         (wr_ptr - rd_ptr) :
-                                         (AUDIO_RING_SIZE - rd_ptr + wr_ptr);
+                            current_avail = (wr_ptr >= rd_ptr) ?
+                                             (wr_ptr - rd_ptr) :
+                                             (AUDIO_RING_SIZE - rd_ptr + wr_ptr);
 
-                        // 1. Tăng Time Constant của Low-Pass Filter (~32ms)
-                        // >> 8 giúp giá trị ổn định hơn, triệt tiêu hoàn toàn rung chấn từ USB
-                        int64_t current_fp = (int64_t)current_avail << 16;
-                        smoothed_avail_fp = smoothed_avail_fp - (smoothed_avail_fp >> 8) + (current_fp >> 8);
+                            // 1. Low-Pass Filter (~32ms time constant) triệt tiêu hoàn toàn rung chấn từ USB/DMA
+                            int64_t current_fp = (int64_t)current_avail << 16;
+                            smoothed_avail_fp = smoothed_avail_fp - (smoothed_avail_fp >> 8) + (current_fp >> 8);
+                            smoothed_avail = (int32_t)(smoothed_avail_fp >> 16);
 
-                        smoothed_avail = smoothed_avail_fp >> 16;
+                            int32_t target_level = AUDIO_RING_SIZE / 2;
+                            int32_t error = smoothed_avail - target_level;
 
-                        // Tốt nhất không nên hardcode 2048, phòng trường hợp bạn đổi AUDIO_RING_SIZE
-                        int32_t target_level = AUDIO_RING_SIZE / 2;
-                        int32_t error = smoothed_avail - target_level;
+                            // 2. Deadband: nếu sai số nhỏ trong khoảng +/- 64 bytes (~8 frames 32-bit),
+                            // coi như buffer đã ở setpoint để loại bỏ hoàn toàn jitter khi phát ổn định
+                            int32_t active_error = error;
+                            if (active_error > -64 && active_error < 64) {
+                                active_error = 0;
+                            }
 
-                        // 2. Bộ Tích Phân (Integral)
-                        feedback_integral += error;
+                            // 3. Bộ tích phân (Integral) với dải anti-windup rộng (+/- 100,000,000)
+                            // Tích lũy ở tần số 8000Hz (mỗi microframe).
+                            // Với dải +/- 100,000,000 và >> 14:
+                            // i_term có thể bù trừ tối đa +/- 6100 đơn vị (~745 Hz / 15,500 ppm),
+                            // đảm bảo KHÔNG BAO GIỜ bị bão hòa hay trôi buffer sau 30s trên điện thoại!
+                            feedback_integral += active_error;
+                            if(feedback_integral > 100000000LL) feedback_integral = 100000000LL;
+                            if(feedback_integral < -100000000LL) feedback_integral = -100000000LL;
 
-                        if(feedback_integral > 1500000) feedback_integral = 1500000; // Siết lại Anti-windup
-                        if(feedback_integral < -1500000) feedback_integral = -1500000;
+                            // 4. Hệ số P mượt mà (active_error >> 3) để tránh giật bước nhảy sample của host
+                            int32_t p_term = active_error >> 3;
+                            int32_t i_term = (int32_t)(feedback_integral >> 14);
 
-                        // 3. Tuning hệ số P và I
-                        // Giảm Kp xuống (dịch trái 1 thay vì 2) để mượt hơn
-                        int32_t p_term = error << 1;
+                            dynamic_fb = audio_feedback_val - (p_term + i_term);
 
-                        // Giảm nhẹ Ki để hệ thống không bị over-shoot khi bù trừ
-                        int32_t i_term = feedback_integral >> 11;
+                            // 5. Giới hạn biên độ an toàn (+/- 3.125% ~ +/- 1500 Hz)
+                            uint32_t max_fb = audio_feedback_val + (audio_feedback_val >> 5);
+                            uint32_t min_fb = audio_feedback_val - (audio_feedback_val >> 5);
 
-                        dynamic_fb = audio_feedback_val - (p_term + i_term);
-
-                        // 4. Giữ nguyên kỷ luật thép (Biên độ 5%)
-                        uint32_t max_fb = audio_feedback_val + (audio_feedback_val / 20);
-                        uint32_t min_fb = audio_feedback_val - (audio_feedback_val / 20);
-
-                        if (dynamic_fb > max_fb) dynamic_fb = max_fb;
-                        if (dynamic_fb < min_fb) dynamic_fb = min_fb;
+                            if (dynamic_fb > max_fb) dynamic_fb = max_fb;
+                            if (dynamic_fb < min_fb) dynamic_fb = min_fb;
+                        }
 
                         USBHS_EP2_Tx_Buf[0] = dynamic_fb & 0xFF;
                         USBHS_EP2_Tx_Buf[1] = (dynamic_fb >> 8) & 0xFF;
@@ -449,7 +492,7 @@ void USBHS_IRQHandler( void )
                         USBHS_EP2_Tx_Buf[3] = (dynamic_fb >> 24) & 0xFF;
 
                         USBHSD->UEP2_TX_LEN = 4;
-                        USBHSD->UEP2_TX_CTRL = (USBHSD->UEP2_TX_CTRL & ~USBHS_UEP_T_RES_MASK) | USBHS_UEP_T_RES_ACK;
+                        USBHSD->UEP2_TX_CTRL = USBHS_UEP_T_TOG_DATA0 | USBHS_UEP_T_RES_ACK;
                         break;
                     }
                     default :
@@ -481,34 +524,37 @@ void USBHS_IRQHandler( void )
                                       current_audio_freq[3] = USBHS_EP0_Buf[3];
 
                                       // 2. Tính toán tần số mục tiêu từ mảng vừa cập nhật
-                                      target_freq = (current_audio_freq[3] << 24) |
-                                                             (current_audio_freq[2] << 16) |
-                                                             (current_audio_freq[1] << 8)  |
-                                                             current_audio_freq[0];
+                                      target_freq = ((uint32_t)current_audio_freq[3] << 24) |
+                                                    ((uint32_t)current_audio_freq[2] << 16) |
+                                                    ((uint32_t)current_audio_freq[1] << 8)  |
+                                                    current_audio_freq[0];
 
-                                        if (target_freq == 44100) {
-                                            // Feedback = (43750 / 8000) * 65536 = 358400 = 0x00057800
-                                            audio_feedback_val = 0x00057800;
-                                        } else if (target_freq == 48000) {
-                                            // Feedback = (48076.92 / 8000) * 65536 = 393830 = 0x00060266 -> Làm tròn thành 0x00060266 hoặc 0x00060276
-                                            audio_feedback_val = (uint32_t)((47945.205 / 8000.0) * 65536.0);
-                                        } else if (target_freq == 96000) {
-                                            // Feedback = (96153.85 / 8000) * 65536 = 787692 = 0x000C04EC
-                                            audio_feedback_val = 0x000C04EC;
-                                        }else if (target_freq == 192000) {
-                                            audio_feedback_val = 0x001809D9;
-                                        }
-
-                                      smoothed_avail_fp = (AUDIO_RING_SIZE / 2) << 16;
+                                      audio_feedback_val = Calc_Nominal_Feedback(target_freq);
+                                      dynamic_fb = audio_feedback_val;
+                                      smoothed_avail_fp = (int64_t)(AUDIO_RING_SIZE / 2) << 16;
+                                      smoothed_avail = AUDIO_RING_SIZE / 2;
                                       feedback_integral = 0;
 
-                                      // 3. Tái cấu hình bộ chia xung của I2S theo tần số mới ngay lập tức
+                                      USBHS_EP2_Tx_Buf[0] = audio_feedback_val & 0xFF;
+                                      USBHS_EP2_Tx_Buf[1] = (audio_feedback_val >> 8) & 0xFF;
+                                      USBHS_EP2_Tx_Buf[2] = (audio_feedback_val >> 16) & 0xFF;
+                                      USBHS_EP2_Tx_Buf[3] = (audio_feedback_val >> 24) & 0xFF;
+
+                                      // 3. Tạm dừng DMA ngay lập tức và đặt cờ tái cấu hình I2S ở vòng lặp main
                                       DMA_Cmd(DMA1_Channel5, DISABLE);
                                       audio_wr_ptr = 0;
                                       audio_rd_ptr = 0;
                                       playback_started = 0;
-                                      I2S2_Init(target_freq, current_bit_depth);
-                                      DMA_Cmd(DMA1_Channel5, ENABLE);
+                                      i2s_reinit_pending = 1;
+                                  }
+                              }
+                              else if( ((USBHS_SetupReqType & USB_REQ_TYP_MASK) == USB_REQ_TYP_CLASS) &&
+                                       ((USBHS_SetupReqType & 0x80) == 0) &&
+                                       (USBHS_SetupReqCode == 0x01) &&
+                                       ((uint8_t)(USBHS_SetupReqIndex >> 8) == 4) )
+                              {
+                                  if (len >= 1) {
+                                      selector_cur = USBHS_EP0_Buf[0];
                                   }
                               }
 
@@ -533,46 +579,46 @@ void USBHS_IRQHandler( void )
 
                     /* Endpoint 1 OUT: Đọc các gói ISOCHRONOUS Audio streaming tại đây */
                     case USBHS_UIS_TOKEN_OUT | DEF_UEP1:
-//                        printf("audio at ep1");
-                        if ( intst & USBHS_UIS_TOG_OK ){
-                            len = USBHSD->RX_LEN; // Số byte nhạc nhận được từ PC trong Microframe này
-                            if (len > 0){
-                                uint32_t wr_ptr = audio_wr_ptr;
-                                uint32_t free_space = (audio_rd_ptr + AUDIO_RING_SIZE - wr_ptr - 1) % AUDIO_RING_SIZE;
+                    {
+                        /* Isochronous OUT không có handshake toggle, luôn nhận mọi gói DATA0 từ Host */
+                        len = USBHSD->RX_LEN; // Số byte nhạc nhận được từ PC/Phone trong Microframe này
+                        if (len > 0){
+                            uint32_t wr_ptr = audio_wr_ptr;
+                            uint32_t free_space = (audio_rd_ptr + AUDIO_RING_SIZE - wr_ptr - 1) & (AUDIO_RING_SIZE - 1);
 
-                                if (len <= free_space){
-                                    // Giai đoạn 1: Đoạn dữ liệu từ vị trí wr_ptr đến cuối mảng Ring Buffer
-                                    if (wr_ptr + len <= AUDIO_RING_SIZE){
-                                        memcpy(&audio_ring_buf[wr_ptr], USBHS_EP1_Rx_Buf, len);
-                                        /* Capture preview of first bytes for debugging and record length */
-                                        if (!usb_ep1_preview_ready) {
-                                            uint32_t copy_len = (len < sizeof(usb_ep1_preview)) ? len : sizeof(usb_ep1_preview);
-                                            memcpy((void*)usb_ep1_preview, USBHS_EP1_Rx_Buf, copy_len);
-                                            usb_ep1_preview_ready = 1;
-                                            usb_ep1_last_len = len;
-                                        }
-                                        wr_ptr = (wr_ptr + len) % AUDIO_RING_SIZE;
-                                    }else{  // Giai đoạn 2: Nếu bị tràn biên mảng, vòng ngược phần còn lại về đầu mảng
-                                        uint32_t first_part = AUDIO_RING_SIZE - wr_ptr;
-                                        memcpy(&audio_ring_buf[wr_ptr], USBHS_EP1_Rx_Buf, first_part);
-                                        memcpy(&audio_ring_buf[0], &USBHS_EP1_Rx_Buf[first_part], len - first_part);
-                                        /* Capture preview when wrapped and record length */
-                                        if (!usb_ep1_preview_ready) {
-                                            uint32_t copy_len = (first_part < sizeof(usb_ep1_preview)) ? first_part : sizeof(usb_ep1_preview);
-                                            memcpy((void*)usb_ep1_preview, USBHS_EP1_Rx_Buf, copy_len);
-                                            usb_ep1_preview_ready = 1;
-                                            usb_ep1_last_len = len;
-                                        }
-                                        wr_ptr = len - first_part;
+                            if (len <= free_space){
+                                // Giai đoạn 1: Đoạn dữ liệu từ vị trí wr_ptr đến cuối mảng Ring Buffer
+                                if (wr_ptr + len <= AUDIO_RING_SIZE){
+                                    memcpy(&audio_ring_buf[wr_ptr], USBHS_EP1_Rx_Buf, len);
+                                    /* Capture preview of first bytes for debugging and record length */
+                                    if (!usb_ep1_preview_ready) {
+                                        uint32_t copy_len = (len < sizeof(usb_ep1_preview)) ? len : sizeof(usb_ep1_preview);
+                                        memcpy((void*)usb_ep1_preview, USBHS_EP1_Rx_Buf, copy_len);
+                                        usb_ep1_preview_ready = 1;
+                                        usb_ep1_last_len = len;
                                     }
+                                    wr_ptr = (wr_ptr + len) & (AUDIO_RING_SIZE - 1);
+                                }else{  // Giai đoạn 2: Nếu bị tràn biên mảng, vòng ngược phần còn lại về đầu mảng
+                                    uint32_t first_part = AUDIO_RING_SIZE - wr_ptr;
+                                    memcpy(&audio_ring_buf[wr_ptr], USBHS_EP1_Rx_Buf, first_part);
+                                    memcpy(&audio_ring_buf[0], &USBHS_EP1_Rx_Buf[first_part], len - first_part);
+                                    /* Capture preview when wrapped and record length */
+                                    if (!usb_ep1_preview_ready) {
+                                        uint32_t copy_len = (first_part < sizeof(usb_ep1_preview)) ? first_part : sizeof(usb_ep1_preview);
+                                        memcpy((void*)usb_ep1_preview, USBHS_EP1_Rx_Buf, copy_len);
+                                        usb_ep1_preview_ready = 1;
+                                        usb_ep1_last_len = len;
+                                    }
+                                    wr_ptr = len - first_part;
                                 }
-                                audio_wr_ptr = wr_ptr; // Ghi nguyên tử, an toàn tuyệt đối không cần khóa ngắt
                             }
-
-                            // Giữ Endpoint luôn sẵn sàng nhận gói tiếp theo
-                            USBHSD->UEP1_RX_CTRL = (USBHSD->UEP1_RX_CTRL & ~USBHS_UEP_R_RES_MASK) | USBHS_UEP_R_RES_ACK;
+                            audio_wr_ptr = wr_ptr; // Ghi nguyên tử, an toàn tuyệt đối không cần khóa ngắt
                         }
+
+                        // Giữ Endpoint luôn ở DATA0 và ACK để sẵn sàng nhận gói Isochronous tiếp theo
+                        USBHSD->UEP1_RX_CTRL = USBHS_UEP_R_TOG_DATA0 | USBHS_UEP_R_RES_ACK;
                         break;
+                    }
 
                     default:
                         break;
@@ -635,7 +681,6 @@ void USBHS_IRQHandler( void )
                 }
             }else if (entity_id == 4){
                 if (USBHS_SetupReqCode == 0x01) {
-                    static __attribute__((aligned(4))) uint8_t selector_cur = 1;
                     pUSBHS_Descr = &selector_cur;
                     len = (USBHS_SetupReqLen > 1) ? 1 : USBHS_SetupReqLen;
                     errflag = 0x00;
@@ -650,7 +695,7 @@ void USBHS_IRQHandler( void )
                     }
                     else if( ( USBHS_SetupReqValue >> 8 ) == USB_DESCR_TYP_CONFIG ){
                         pUSBHS_Descr = MyCfgDescr_HS;
-                        len = DEF_USBD_CONFIG_HS_DESC_LEN;
+                        len = (uint16_t)MyCfgDescr_HS[2] | ((uint16_t)MyCfgDescr_HS[3] << 8);
                     }
                     else if( ( USBHS_SetupReqValue >> 8 ) == USB_DESCR_TYP_QUALIF ){
                         pUSBHS_Descr = MyQuaDesc;
@@ -658,7 +703,7 @@ void USBHS_IRQHandler( void )
                     }
                     else if( ( USBHS_SetupReqValue >> 8 ) == USB_DESCR_TYP_SPEED ){
                         pUSBHS_Descr = MyCfgDescr_HS;
-                        len = DEF_USBD_CONFIG_HS_DESC_LEN;
+                        len = (uint16_t)MyCfgDescr_HS[2] | ((uint16_t)MyCfgDescr_HS[3] << 8);
                     }
                     else if( ( USBHS_SetupReqValue >> 8 ) == USB_DESCR_TYP_STRING ){
                         switch( (uint8_t)( USBHS_SetupReqValue & 0xFF ) ){
@@ -710,7 +755,7 @@ void USBHS_IRQHandler( void )
                     if( ( USBHS_SetupReqType & USB_REQ_RECIP_MASK ) == USB_REQ_RECIP_ENDP ){
                         if( (uint8_t)( USBHS_SetupReqValue & 0xFF ) == USB_REQ_FEAT_ENDP_HALT ){
                             if( (uint8_t)( USBHS_SetupReqIndex & 0xFF ) == 0x82 ){ // EP2 IN (Feedback)
-                                USBHSD->UEP1_TX_CTRL = USBHS_UEP_T_TOG_DATA0 | USBHS_UEP_T_RES_NAK;
+                                USBHSD->UEP2_TX_CTRL = USBHS_UEP_T_TOG_DATA0 | USBHS_UEP_T_RES_NAK;
                             }
                             else if( (uint8_t)( USBHS_SetupReqIndex & 0xFF ) == 0x01 ){ // EP1 OUT (Audio Data)
                                 USBHSD->UEP1_RX_CTRL = USBHS_UEP_R_TOG_DATA0 | USBHS_UEP_R_RES_ACK;
@@ -729,54 +774,47 @@ void USBHS_IRQHandler( void )
                             audio_rd_ptr = 0;
                             playback_started = 0;
 
-                            memset(audio_ring_buf, 0, AUDIO_RING_SIZE);
                             memset(i2s_tx_dma_buf, 0, I2S_DMA_BUF_SIZE);
 
                             feedback_integral = 0;
+                            USBHSD->UEP2_TX_CTRL = USBHS_UEP_T_TOG_DATA0 | USBHS_UEP_T_RES_NAK;
 
                             errflag = 0x00;
                             break;      
                         } else if (current_alt_setting == 1) {
                             current_bit_depth = I2S_DataFormat_16b;
-                            // existing init code
                         } else if (current_alt_setting == 2) {
                             current_bit_depth = I2S_DataFormat_24b;
-                            // existing init code
+                        } else if (current_alt_setting == 3) {
+                            current_bit_depth = I2S_DataFormat_32b;
                         }
 
-                        target_freq = (current_audio_freq[3] << 24) |
-                                               (current_audio_freq[2] << 16) |
-                                               (current_audio_freq[1] << 8)  |
-                                               current_audio_freq[0];
-                        if (target_freq == 44100) audio_feedback_val = 0x00057800;
-                        else if (target_freq == 48000) audio_feedback_val = (uint32_t)((47945.205 / 8000.0) * 65536.0);
-                        else if (target_freq == 96000) audio_feedback_val = 0x000C04EC;
-                        else if (target_freq == 192000) audio_feedback_val = 0x001809D9;
-
+                        target_freq = ((uint32_t)current_audio_freq[3] << 24) |
+                                      ((uint32_t)current_audio_freq[2] << 16) |
+                                      ((uint32_t)current_audio_freq[1] << 8)  |
+                                      current_audio_freq[0];
+                        audio_feedback_val = Calc_Nominal_Feedback(target_freq);
+                        dynamic_fb = audio_feedback_val;
 
                         USBHS_EP2_Tx_Buf[0] = audio_feedback_val & 0xFF;
                         USBHS_EP2_Tx_Buf[1] = (audio_feedback_val >> 8) & 0xFF;
                         USBHS_EP2_Tx_Buf[2] = (audio_feedback_val >> 16) & 0xFF;
                         USBHS_EP2_Tx_Buf[3] = (audio_feedback_val >> 24) & 0xFF;
                         USBHSD->UEP2_TX_LEN = 4;
-                        USBHSD->UEP2_TX_CTRL = (USBHSD->UEP2_TX_CTRL & ~USBHS_UEP_T_RES_MASK) | USBHS_UEP_T_RES_ACK;
+                        USBHSD->UEP2_TX_CTRL = USBHS_UEP_T_TOG_DATA0 | USBHS_UEP_T_RES_ACK;
+                        USBHSD->UEP1_RX_CTRL = USBHS_UEP_R_TOG_DATA0 | USBHS_UEP_R_RES_ACK;
 
-
+                        // Xóa sạch con trỏ Ring Buffer và bộ đệm DMA để đồng bộ lại từ đầu
                         DMA_Cmd(DMA1_Channel5, DISABLE);
-
-                        // Xóa sạch con trỏ Ring Buffer và bộ đệm phát để đồng bộ lại từ đầu
-                        memset(audio_ring_buf, 0, AUDIO_RING_SIZE);
                         memset(i2s_tx_dma_buf, 0, I2S_DMA_BUF_SIZE);
                         audio_wr_ptr = 0;
                         audio_rd_ptr = 0;
                         playback_started = 0; // Tắt flag phát nhạc để tích lũy buffer lại
-                        smoothed_avail_fp = (AUDIO_RING_SIZE / 2) << 16;
+                        smoothed_avail_fp = (int64_t)(AUDIO_RING_SIZE / 2) << 16;
                         smoothed_avail = AUDIO_RING_SIZE / 2;
                         feedback_integral = 0;
 
-                        I2S2_Init(target_freq, current_bit_depth);
-
-                        DMA_Cmd(DMA1_Channel5, ENABLE);
+                        i2s_reinit_pending = 1;
                     }
                     errflag = 0x00;
                     break;

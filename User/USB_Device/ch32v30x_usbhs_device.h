@@ -117,6 +117,7 @@ extern volatile int64_t feedback_integral;
 extern volatile uint32_t current_avail;
 extern volatile int32_t smoothed_avail;
 extern volatile uint32_t ep1_in_cnt;
+extern volatile uint8_t i2s_reinit_pending;
 
 /********************************************************************************/
 /* Function Declaration */
@@ -127,6 +128,7 @@ extern void USBHS_Device_SetAddress( uint32_t address );
 extern void USBHS_IRQHandler( void );
 extern void USBHS_Sleep_WakeUp_Cfg( void );
 extern uint8_t USBHS_Endp_DataUp( uint8_t endp, uint8_t *pbuf, uint16_t len, uint8_t mod );
+extern void USB_Audio_Process( void );
 
 #ifdef __cplusplus
 }

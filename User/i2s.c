@@ -6,6 +6,7 @@
  */
 #include "i2s.h"
 #include "string.h"
+#include "USB_Device/ch32v30x_usbhs_device.h"
 
 __attribute__ ((aligned(4))) uint8_t i2s_tx_dma_buf[I2S_DMA_BUF_SIZE];
 extern uint8_t audio_ring_buf[];
@@ -51,21 +52,25 @@ void I2S2_Init(uint32_t AudioFreq, uint16_t DataFormat){
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA | RCC_APB2Periph_GPIOB | RCC_APB2Periph_AFIO, ENABLE);
 
     // 2. Configure PA8 (Mux Select Output)
-
     // PA8 = LOW (0) -> Select 22.5792 MHz XO for 44.1kHz
-    // PA8 = HIGH (1) -> Select 24.576 MHz XO for 48kHz / 96kHz
+    // PA8 = HIGH (1) -> Select 24.576 MHz XO for 48kHz / 96kHz / 192kHz
     if (AudioFreq == 44100 ) {
         GPIO_ResetBits(GPIOA, GPIO_Pin_8);
     } else {
         GPIO_SetBits(GPIOA, GPIO_Pin_8);
     }
 
-    Delay_Ms(5);
+    DMA_Cmd(DMA1_Channel5, DISABLE);
+    I2S_Cmd(SPI2, DISABLE);
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_SPI2, DISABLE);
 
-    // 3. Initialize PLL3 internal audio clock source
+    // 3. Initialize PLL3 internal audio clock source BEFORE enabling SPI2 APB clock
     PLL3_Audio_Clock_Init(AudioFreq);
 
+    // Enable SPI2 APB clock AFTER I2S2 clock source is selected
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_SPI2, ENABLE);
+    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA1, ENABLE);
+    SPI_I2S_DeInit(SPI2);
 
     // 4. Configure I2S2 Pins (PB12-WS, PB13-CK, PB15-SD)
     GPIO_InitStructure.GPIO_Pin = GPIO_Pin_12 | GPIO_Pin_13 | GPIO_Pin_15;
@@ -73,7 +78,6 @@ void I2S2_Init(uint32_t AudioFreq, uint16_t DataFormat){
     GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
     GPIO_Init(GPIOB, &GPIO_InitStructure);
 
-    I2S_Cmd(SPI2, DISABLE);
     memset(i2s_tx_dma_buf, 0, sizeof(i2s_tx_dma_buf));
 
     I2S_InitStructure.I2S_Mode = I2S_Mode_MasterTx;
@@ -166,58 +170,237 @@ void Fetch_Audio_Data(uint8_t *dest, uint32_t length) {
     }
 
     uint32_t frames = length / 8;
-    uint32_t bytes_needed = (current_bit_depth == I2S_DataFormat_16b) ? (frames * 4) : (frames * 8);
+    uint32_t bytes_per_frame = (current_bit_depth == I2S_DataFormat_16b) ? 4 : 8;
+    uint32_t bytes_needed = frames * bytes_per_frame;
 
     // 2. Underflow protection
+    static uint32_t underflow_count = 0;
     uint16_t *dest_16 = (uint16_t *)dest;
     if (available < bytes_needed) {
         memset(dest, 0, length);
-        playback_started = 0;
+        underflow_count++;
+        if (underflow_count > 25) { // ~66ms sustained underflow -> stream stopped
+            playback_started = 0;
+            underflow_count = 0;
+        }
         return;
+    }
+    underflow_count = 0;
+
+    // 3. Elastic Rate Adaptation with Smooth Linear Interpolation (Zero-Click Resampling)
+    // Eliminates both macro-overflows (after 37s on Android) AND subtle micro-clicks
+    // by smoothly interpolating across the 128-sample block instead of hard sample drops.
+    static uint8_t slip_state = 0; // 0: idle, 1: draining (buffer high), 2: filling (buffer low)
+    static uint8_t slip_timer = 0;
+    int32_t slip = 0;
+
+    // Hysteresis control:
+    // When buffer rises above 20,480 bytes (~62.5%), enter draining mode
+    // Drain until buffer falls back below 17,408 bytes (~53%), then return to idle
+    if (available > (AUDIO_RING_SIZE * 5) / 8) {
+        slip_state = 1;
+    } else if (slip_state == 1 && available <= (AUDIO_RING_SIZE / 2) + 1024) {
+        slip_state = 0;
+    }
+    // When buffer drops below 12,288 bytes (~37.5%), enter filling mode
+    // Fill until buffer climbs back above 15,360 bytes (~47%), then return to idle
+    else if (available < (AUDIO_RING_SIZE * 3) / 8) {
+        slip_state = 2;
+    } else if (slip_state == 2 && available >= (AUDIO_RING_SIZE / 2) - 1024) {
+        slip_state = 0;
+    }
+
+    if (slip_state != 0) {
+        slip_timer++;
+        // Pace: 1 slip every 6 callbacks (~16ms = ~62.5 slips/sec, perfectly countering 54.8 Hz drift)
+        if (slip_timer >= 6) {
+            slip_timer = 0;
+            slip = (slip_state == 1) ? 1 : -1;
+        }
+    } else {
+        slip_timer = 0;
     }
 
     uint32_t idx = 0;
 
-    if (current_bit_depth == I2S_DataFormat_16b) {
-        // --- 16-BIT DECODING (Left Channel first, Right Channel second) ---
-        for (uint32_t i = 0; i < frames; i++) {
-            uint8_t l0 = audio_ring_buf[local_rd++]; if(local_rd >= AUDIO_RING_SIZE) local_rd = 0;
-            uint8_t l1 = audio_ring_buf[local_rd++]; if(local_rd >= AUDIO_RING_SIZE) local_rd = 0;
-            uint8_t r0 = audio_ring_buf[local_rd++]; if(local_rd >= AUDIO_RING_SIZE) local_rd = 0;
-            uint8_t r1 = audio_ring_buf[local_rd++]; if(local_rd >= AUDIO_RING_SIZE) local_rd = 0;
+    if (slip == 1) {
+        // --- SMOOTH COMPRESS: Interpolate 129 input frames into 128 output frames ---
+        // S_i -> S_{i+1} linear crossfade across the 128 samples:
+        // Out[i] = S[i] + ((S[i+1] - S[i]) * i) / 128
+        // At i=0: Out[0] = S[0] (exact match with previous block)
+        // At i=127: Out[127] ~= S[128] (exact match with next block S[128..129])
+        // Result: 100% continuous waveform, ZERO impulse, ZERO pop/click!
+        if (current_bit_depth == I2S_DataFormat_16b) {
+            for (uint32_t i = 0; i < frames; i++) {
+                uint32_t c_pos = (local_rd + (i * 4)) & (AUDIO_RING_SIZE - 1);
+                uint32_t n_pos = (local_rd + ((i + 1) * 4)) & (AUDIO_RING_SIZE - 1);
 
-            uint16_t left_audio  = (uint16_t)((l1 << 8) | l0);
-            uint16_t right_audio = (uint16_t)((r1 << 8) | r0);
+                int16_t s0_L = (int16_t)((audio_ring_buf[(c_pos + 1) & (AUDIO_RING_SIZE - 1)] << 8) | audio_ring_buf[c_pos]);
+                int16_t s0_R = (int16_t)((audio_ring_buf[(c_pos + 3) & (AUDIO_RING_SIZE - 1)] << 8) | audio_ring_buf[(c_pos + 2) & (AUDIO_RING_SIZE - 1)]);
 
-            // Swapped to standard I2S ordering: LEFT -> RIGHT
-            dest_16[idx++] = left_audio;    // High half of left slot
-            dest_16[idx++] = 0x0000;        // Low half of left slot
-            dest_16[idx++] = right_audio;   // High half of right slot
-            dest_16[idx++] = 0x0000;        // Low half of right slot
+                int16_t s1_L = (int16_t)((audio_ring_buf[(n_pos + 1) & (AUDIO_RING_SIZE - 1)] << 8) | audio_ring_buf[n_pos]);
+                int16_t s1_R = (int16_t)((audio_ring_buf[(n_pos + 3) & (AUDIO_RING_SIZE - 1)] << 8) | audio_ring_buf[(n_pos + 2) & (AUDIO_RING_SIZE - 1)]);
+
+                int16_t out_L = s0_L + (int16_t)(((int32_t)(s1_L - s0_L) * (int32_t)i) >> 7);
+                int16_t out_R = s0_R + (int16_t)(((int32_t)(s1_R - s0_R) * (int32_t)i) >> 7);
+
+                dest_16[idx++] = (uint16_t)out_L;
+                dest_16[idx++] = 0x0000;
+                dest_16[idx++] = (uint16_t)out_R;
+                dest_16[idx++] = 0x0000;
+            }
+            local_rd = (local_rd + ((frames + 1) * 4)) & (AUDIO_RING_SIZE - 1);
+        } else {
+            for (uint32_t i = 0; i < frames; i++) {
+                uint32_t c_pos = (local_rd + (i * 8)) & (AUDIO_RING_SIZE - 1);
+                uint32_t n_pos = (local_rd + ((i + 1) * 8)) & (AUDIO_RING_SIZE - 1);
+
+                uint8_t l0 = audio_ring_buf[c_pos];
+                uint8_t l1 = audio_ring_buf[(c_pos + 1) & (AUDIO_RING_SIZE - 1)];
+                uint8_t l2 = audio_ring_buf[(c_pos + 2) & (AUDIO_RING_SIZE - 1)];
+                uint8_t l3 = audio_ring_buf[(c_pos + 3) & (AUDIO_RING_SIZE - 1)];
+
+                uint8_t r0 = audio_ring_buf[(c_pos + 4) & (AUDIO_RING_SIZE - 1)];
+                uint8_t r1 = audio_ring_buf[(c_pos + 5) & (AUDIO_RING_SIZE - 1)];
+                uint8_t r2 = audio_ring_buf[(c_pos + 6) & (AUDIO_RING_SIZE - 1)];
+                uint8_t r3 = audio_ring_buf[(c_pos + 7) & (AUDIO_RING_SIZE - 1)];
+
+                int32_t s0_L = (int32_t)((uint32_t)l0 | ((uint32_t)l1 << 8) | ((uint32_t)l2 << 16) | ((uint32_t)l3 << 24));
+                int32_t s0_R = (int32_t)((uint32_t)r0 | ((uint32_t)r1 << 8) | ((uint32_t)r2 << 16) | ((uint32_t)r3 << 24));
+
+                uint8_t nl0 = audio_ring_buf[n_pos];
+                uint8_t nl1 = audio_ring_buf[(n_pos + 1) & (AUDIO_RING_SIZE - 1)];
+                uint8_t nl2 = audio_ring_buf[(n_pos + 2) & (AUDIO_RING_SIZE - 1)];
+                uint8_t nl3 = audio_ring_buf[(n_pos + 3) & (AUDIO_RING_SIZE - 1)];
+
+                uint8_t nr0 = audio_ring_buf[(n_pos + 4) & (AUDIO_RING_SIZE - 1)];
+                uint8_t nr1 = audio_ring_buf[(n_pos + 5) & (AUDIO_RING_SIZE - 1)];
+                uint8_t nr2 = audio_ring_buf[(n_pos + 6) & (AUDIO_RING_SIZE - 1)];
+                uint8_t nr3 = audio_ring_buf[(n_pos + 7) & (AUDIO_RING_SIZE - 1)];
+
+                int32_t s1_L = (int32_t)((uint32_t)nl0 | ((uint32_t)nl1 << 8) | ((uint32_t)nl2 << 16) | ((uint32_t)nl3 << 24));
+                int32_t s1_R = (int32_t)((uint32_t)nr0 | ((uint32_t)nr1 << 8) | ((uint32_t)nr2 << 16) | ((uint32_t)nr3 << 24));
+
+                int32_t out_L = s0_L + (int32_t)(((int64_t)(s1_L - s0_L) * (int64_t)i) >> 7);
+                int32_t out_R = s0_R + (int32_t)(((int64_t)(s1_R - s0_R) * (int64_t)i) >> 7);
+
+                dest_16[idx++] = (uint16_t)((uint32_t)out_L >> 16);
+                dest_16[idx++] = (uint16_t)((uint32_t)out_L & 0xFFFF);
+                dest_16[idx++] = (uint16_t)((uint32_t)out_R >> 16);
+                dest_16[idx++] = (uint16_t)((uint32_t)out_R & 0xFFFF);
+            }
+            local_rd = (local_rd + ((frames + 1) * 8)) & (AUDIO_RING_SIZE - 1);
+        }
+    } else if (slip == -1) {
+        // --- SMOOTH STRETCH: Interpolate 127 input frames into 128 output frames ---
+        if (current_bit_depth == I2S_DataFormat_16b) {
+            for (uint32_t i = 0; i < frames; i++) {
+                uint32_t k = (i * (frames - 2)) >> 7; // map 0..127 to 0..126
+                uint32_t frac = (i * (frames - 2)) & 0x7F;
+                uint32_t c_pos = (local_rd + (k * 4)) & (AUDIO_RING_SIZE - 1);
+                uint32_t n_pos = (local_rd + ((k + 1) * 4)) & (AUDIO_RING_SIZE - 1);
+
+                int16_t s0_L = (int16_t)((audio_ring_buf[(c_pos + 1) & (AUDIO_RING_SIZE - 1)] << 8) | audio_ring_buf[c_pos]);
+                int16_t s0_R = (int16_t)((audio_ring_buf[(c_pos + 3) & (AUDIO_RING_SIZE - 1)] << 8) | audio_ring_buf[(c_pos + 2) & (AUDIO_RING_SIZE - 1)]);
+
+                int16_t s1_L = (int16_t)((audio_ring_buf[(n_pos + 1) & (AUDIO_RING_SIZE - 1)] << 8) | audio_ring_buf[n_pos]);
+                int16_t s1_R = (int16_t)((audio_ring_buf[(n_pos + 3) & (AUDIO_RING_SIZE - 1)] << 8) | audio_ring_buf[(n_pos + 2) & (AUDIO_RING_SIZE - 1)]);
+
+                int16_t out_L = s0_L + (int16_t)(((int32_t)(s1_L - s0_L) * (int32_t)frac) >> 7);
+                int16_t out_R = s0_R + (int16_t)(((int32_t)(s1_R - s0_R) * (int32_t)frac) >> 7);
+
+                dest_16[idx++] = (uint16_t)out_L;
+                dest_16[idx++] = 0x0000;
+                dest_16[idx++] = (uint16_t)out_R;
+                dest_16[idx++] = 0x0000;
+            }
+            local_rd = (local_rd + ((frames - 1) * 4)) & (AUDIO_RING_SIZE - 1);
+        } else {
+            for (uint32_t i = 0; i < frames; i++) {
+                uint32_t k = (i * (frames - 2)) >> 7; // map 0..127 to 0..126
+                uint32_t frac = (i * (frames - 2)) & 0x7F;
+                uint32_t c_pos = (local_rd + (k * 8)) & (AUDIO_RING_SIZE - 1);
+                uint32_t n_pos = (local_rd + ((k + 1) * 8)) & (AUDIO_RING_SIZE - 1);
+
+                uint8_t l0 = audio_ring_buf[c_pos];
+                uint8_t l1 = audio_ring_buf[(c_pos + 1) & (AUDIO_RING_SIZE - 1)];
+                uint8_t l2 = audio_ring_buf[(c_pos + 2) & (AUDIO_RING_SIZE - 1)];
+                uint8_t l3 = audio_ring_buf[(c_pos + 3) & (AUDIO_RING_SIZE - 1)];
+
+                uint8_t r0 = audio_ring_buf[(c_pos + 4) & (AUDIO_RING_SIZE - 1)];
+                uint8_t r1 = audio_ring_buf[(c_pos + 5) & (AUDIO_RING_SIZE - 1)];
+                uint8_t r2 = audio_ring_buf[(c_pos + 6) & (AUDIO_RING_SIZE - 1)];
+                uint8_t r3 = audio_ring_buf[(c_pos + 7) & (AUDIO_RING_SIZE - 1)];
+
+                int32_t s0_L = (int32_t)((uint32_t)l0 | ((uint32_t)l1 << 8) | ((uint32_t)l2 << 16) | ((uint32_t)l3 << 24));
+                int32_t s0_R = (int32_t)((uint32_t)r0 | ((uint32_t)r1 << 8) | ((uint32_t)r2 << 16) | ((uint32_t)r3 << 24));
+
+                uint8_t nl0 = audio_ring_buf[n_pos];
+                uint8_t nl1 = audio_ring_buf[(n_pos + 1) & (AUDIO_RING_SIZE - 1)];
+                uint8_t nl2 = audio_ring_buf[(n_pos + 2) & (AUDIO_RING_SIZE - 1)];
+                uint8_t nl3 = audio_ring_buf[(n_pos + 3) & (AUDIO_RING_SIZE - 1)];
+
+                uint8_t nr0 = audio_ring_buf[(n_pos + 4) & (AUDIO_RING_SIZE - 1)];
+                uint8_t nr1 = audio_ring_buf[(n_pos + 5) & (AUDIO_RING_SIZE - 1)];
+                uint8_t nr2 = audio_ring_buf[(n_pos + 6) & (AUDIO_RING_SIZE - 1)];
+                uint8_t nr3 = audio_ring_buf[(n_pos + 7) & (AUDIO_RING_SIZE - 1)];
+
+                int32_t s1_L = (int32_t)((uint32_t)nl0 | ((uint32_t)nl1 << 8) | ((uint32_t)nl2 << 16) | ((uint32_t)nl3 << 24));
+                int32_t s1_R = (int32_t)((uint32_t)nr0 | ((uint32_t)nr1 << 8) | ((uint32_t)nr2 << 16) | ((uint32_t)nr3 << 24));
+
+                int32_t out_L = s0_L + (int32_t)(((int64_t)(s1_L - s0_L) * (int64_t)frac) >> 7);
+                int32_t out_R = s0_R + (int32_t)(((int64_t)(s1_R - s0_R) * (int64_t)frac) >> 7);
+
+                dest_16[idx++] = (uint16_t)((uint32_t)out_L >> 16);
+                dest_16[idx++] = (uint16_t)((uint32_t)out_L & 0xFFFF);
+                dest_16[idx++] = (uint16_t)((uint32_t)out_R >> 16);
+                dest_16[idx++] = (uint16_t)((uint32_t)out_R & 0xFFFF);
+            }
+            local_rd = (local_rd + ((frames - 1) * 8)) & (AUDIO_RING_SIZE - 1);
         }
     } else {
-        // --- 24-BIT DECODING (Left Channel first, Right Channel second) ---
-        for (uint32_t i = 0; i < frames; i++) {
-            uint8_t l0 = audio_ring_buf[local_rd++]; if(local_rd >= AUDIO_RING_SIZE) local_rd = 0;
-            uint8_t l1 = audio_ring_buf[local_rd++]; if(local_rd >= AUDIO_RING_SIZE) local_rd = 0;
-            uint8_t l2 = audio_ring_buf[local_rd++]; if(local_rd >= AUDIO_RING_SIZE) local_rd = 0;
-            uint8_t l3 = audio_ring_buf[local_rd++]; if(local_rd >= AUDIO_RING_SIZE) local_rd = 0;
+        // --- NORMAL PLAYBACK: 100% Bit-Perfect 1:1 Direct Read (Standard on PC) ---
+        if (current_bit_depth == I2S_DataFormat_16b) {
+            for (uint32_t i = 0; i < frames; i++) {
+                uint8_t l0 = audio_ring_buf[local_rd];
+                uint8_t l1 = audio_ring_buf[(local_rd + 1) & (AUDIO_RING_SIZE - 1)];
+                uint8_t r0 = audio_ring_buf[(local_rd + 2) & (AUDIO_RING_SIZE - 1)];
+                uint8_t r1 = audio_ring_buf[(local_rd + 3) & (AUDIO_RING_SIZE - 1)];
+                local_rd = (local_rd + 4) & (AUDIO_RING_SIZE - 1);
 
-            uint8_t r0 = audio_ring_buf[local_rd++]; if(local_rd >= AUDIO_RING_SIZE) local_rd = 0;
-            uint8_t r1 = audio_ring_buf[local_rd++]; if(local_rd >= AUDIO_RING_SIZE) local_rd = 0;
-            uint8_t r2 = audio_ring_buf[local_rd++]; if(local_rd >= AUDIO_RING_SIZE) local_rd = 0;
-            uint8_t r3 = audio_ring_buf[local_rd++]; if(local_rd >= AUDIO_RING_SIZE) local_rd = 0;
+                uint16_t left_audio  = (uint16_t)((l1 << 8) | l0);
+                uint16_t right_audio = (uint16_t)((r1 << 8) | r0);
 
-            uint32_t val_L = l0 | ((uint32_t)l1 << 8) | ((uint32_t)l2 << 16) | ((uint32_t)l3 << 24);
-            uint32_t val_R = r0 | ((uint32_t)r1 << 8) | ((uint32_t)r2 << 16) | ((uint32_t)r3 << 24);
+                dest_16[idx++] = left_audio;    // High half of left slot
+                dest_16[idx++] = 0x0000;        // Low half of left slot
+                dest_16[idx++] = right_audio;   // High half of right slot
+                dest_16[idx++] = 0x0000;        // Low half of right slot
+            }
+        } else {
+            for (uint32_t i = 0; i < frames; i++) {
+                uint8_t l0 = audio_ring_buf[local_rd];
+                uint8_t l1 = audio_ring_buf[(local_rd + 1) & (AUDIO_RING_SIZE - 1)];
+                uint8_t l2 = audio_ring_buf[(local_rd + 2) & (AUDIO_RING_SIZE - 1)];
+                uint8_t l3 = audio_ring_buf[(local_rd + 3) & (AUDIO_RING_SIZE - 1)];
 
-            // Swapped to standard I2S ordering: LEFT -> RIGHT
-            dest_16[idx++] = (uint16_t)(val_L >> 16);
-            dest_16[idx++] = (uint16_t)(val_L & 0xFFFF);
-            dest_16[idx++] = (uint16_t)(val_R >> 16);
-            dest_16[idx++] = (uint16_t)(val_R & 0xFFFF);
+                uint8_t r0 = audio_ring_buf[(local_rd + 4) & (AUDIO_RING_SIZE - 1)];
+                uint8_t r1 = audio_ring_buf[(local_rd + 5) & (AUDIO_RING_SIZE - 1)];
+                uint8_t r2 = audio_ring_buf[(local_rd + 6) & (AUDIO_RING_SIZE - 1)];
+                uint8_t r3 = audio_ring_buf[(local_rd + 7) & (AUDIO_RING_SIZE - 1)];
+                local_rd = (local_rd + 8) & (AUDIO_RING_SIZE - 1);
+
+                uint32_t val_L = (uint32_t)l0 | ((uint32_t)l1 << 8) | ((uint32_t)l2 << 16) | ((uint32_t)l3 << 24);
+                uint32_t val_R = (uint32_t)r0 | ((uint32_t)r1 << 8) | ((uint32_t)r2 << 16) | ((uint32_t)r3 << 24);
+
+                dest_16[idx++] = (uint16_t)(val_L >> 16);
+                dest_16[idx++] = (uint16_t)(val_L & 0xFFFF);
+                dest_16[idx++] = (uint16_t)(val_R >> 16);
+                dest_16[idx++] = (uint16_t)(val_R & 0xFFFF);
+            }
         }
     }
 
-    audio_rd_ptr = local_rd;
+    if (!i2s_reinit_pending) {
+        audio_rd_ptr = local_rd;
+    }
 }

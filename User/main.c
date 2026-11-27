@@ -70,6 +70,7 @@ int main(void){
 //  uint32_t count = 0;
     // uint32_t sample_idx = 0;
     while(1){
+        USB_Audio_Process();
 //       if(count >= 45000000){
 //            // Format dạng CSV: Sample, Raw_Avail, Smooth_Avail, Integral, Dynamic_FB
 //          sample_idx++;

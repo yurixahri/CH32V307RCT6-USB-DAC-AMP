@@ -24,7 +24,7 @@
 /* Chiều dài cố định của các mảng Descriptor */
 #define DEF_USBD_DEVICE_DESC_LEN     18
 #define DEF_USBD_CONFIG_FS_DESC_LEN  0      /* Chúng ta bỏ hẳn Full-Speed */
-#define DEF_USBD_CONFIG_HS_DESC_LEN  195
+#define DEF_USBD_CONFIG_HS_DESC_LEN  248
 #define DEF_USBD_REPORT_DESC_LEN     0
 #define DEF_USBD_LANG_DESC_LEN       4
 #define DEF_USBD_MANU_DESC_LEN       14     /* "wch.cn" */

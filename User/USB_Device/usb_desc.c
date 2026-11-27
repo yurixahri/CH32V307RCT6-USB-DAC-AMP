@@ -32,14 +32,14 @@ __attribute__ ((aligned(4))) const uint8_t MyDevDescr[] =
 #define UAC2_FEATURE_UNIT_ID                  0x03
 #define UAC2_OUTPUT_TERMINAL_ID               0x04
 
-/* 2. Configuration Descriptor cho chế độ USB High-Speed (169 Bytes) */
+/* 2. Configuration Descriptor cho chế độ USB High-Speed (248 Bytes) */
 /* Configuration Descriptor cho UAC2 High-Speed */
 __attribute__ ((aligned(4))) const uint8_t MyCfgDescr_HS[] =
 {
     /* 1. Configuration Descriptor */
     0x09,       // bLength
     0x02,       // bDescriptorType (CONFIGURATION)
-    0xC3, 0x00, // wTotalLength = 195 bytes (0x00C3)
+    0xF8, 0x00, // wTotalLength = 248 bytes (0x00F8)
     0x02,       // bNumInterfaces
     0x01,       // bConfigurationValue
     0x00,       // iConfiguration
@@ -220,7 +220,7 @@ __attribute__ ((aligned(4))) const uint8_t MyCfgDescr_HS[] =
     0x24,       // bDescriptorType (CS_INTERFACE)
     0x02,       // bDescriptorSubtype (FORMAT_TYPE)
     0x01,       // bFormatType (FORMAT_TYPE_I)
-    0x04,       // bSubcarrierSize (4 Bytes mỗi sample cho UAC2 24-bit)
+    0x04,       // bSubslotSize (4 Bytes mỗi sample cho UAC2 24-bit)
     0x18,       // bBitResolution (24 Bits)
 
     /* 6.3 Endpoint 1 OUT Descriptor (Audio Data) */
@@ -241,6 +241,63 @@ __attribute__ ((aligned(4))) const uint8_t MyCfgDescr_HS[] =
     0x00, 0x00, // wLockDelay
 
     /* 6.5 Endpoint 2 IN Descriptor (Feedback) */
+    0x07,       // bLength
+    0x05,       // bDescriptorType (ENDPOINT)
+    0x82,       // bEndpointAddress (EP2 IN)
+    0x11,       // bmAttributes (Isochronous, Feedback Endpoint)
+    0x04, 0x00, // wMaxPacketSize (4 Bytes)
+    0x01,       // bInterval (1 Microframe = 125us)
+
+    /* ==================================================================== */
+    /* 7. Interface 1 - Audio Streaming (AS) - ALTERNATE SETTING 3 (32-BIT) */
+    0x09,       // bLength
+    0x04,       // bDescriptorType (INTERFACE)
+    0x01,       // bInterfaceNumber (1)
+    0x03,       // bAlternateSetting (3) -> Profile thứ 3 (32-bit)
+    0x02,       // bNumEndpoints (2)
+    0x01,       // bInterfaceClass (AUDIO)
+    0x02,       // bInterfaceSubClass (AUDIO_STREAMING)
+    0x20,       // bInterfaceProtocol (IP_VERSION_02_00)
+    0x00,       // iInterface
+
+    /* 7.1 Class-Specific AS General Descriptor */
+    0x10,       // bLength
+    0x24,       // bDescriptorType (CS_INTERFACE)
+    0x01,       // bDescriptorSubtype (AS_GENERAL)
+    0x02,       // bTerminalLink (Input Terminal ID = 2)
+    0x00,       // bmControls
+    0x01,       // bFormatType (FORMAT_TYPE_I)
+    0x01, 0x00, 0x00, 0x00, // bmFormats (PCM)
+    0x02,       // bNrChannels (2)
+    0x03, 0x00, 0x00, 0x00, // bmChannelConfig
+    0x00,       // iChannelNames
+
+    /* 7.2 Class-Specific AS Format Type Descriptor (32-bit) */
+    0x06,       // bLength
+    0x24,       // bDescriptorType (CS_INTERFACE)
+    0x02,       // bDescriptorSubtype (FORMAT_TYPE)
+    0x01,       // bFormatType (FORMAT_TYPE_I)
+    0x04,       // bSubslotSize (4 Bytes mỗi sample cho UAC2 32-bit)
+    0x20,       // bBitResolution (32 Bits)
+
+    /* 7.3 Endpoint 1 OUT Descriptor (Audio Data) */
+    0x07,       // bLength
+    0x05,       // bDescriptorType (ENDPOINT)
+    0x01,       // bEndpointAddress (EP1 OUT)
+    0x05,       // bmAttributes (Isochronous, Asynchronous)
+    (uint8_t)DEF_USBD_HS_ISO_PACK_SIZE, (uint8_t)(DEF_USBD_HS_ISO_PACK_SIZE >> 8), // wMaxPacketSize (1024)
+    0x01,       // bInterval (1 Microframe = 125us)
+
+    /* 7.4 Class-Specific AS Isochronous Audio Data Endpoint Descriptor */
+    0x08,       // bLength
+    0x25,       // bDescriptorType (CS_ENDPOINT)
+    0x01,       // bDescriptorSubtype (EP_GENERAL)
+    0x00,       // bmAttributes
+    0x00,       // bmControls
+    0x00,       // bLockDelayUnits
+    0x00, 0x00, // wLockDelay
+
+    /* 7.5 Endpoint 2 IN Descriptor (Feedback) */
     0x07,       // bLength
     0x05,       // bDescriptorType (ENDPOINT)
     0x82,       // bEndpointAddress (EP2 IN)
